@@ -1,7 +1,10 @@
 // You can modify this file however you like.
-#include <threadpool.h>
+#include "threadpool.h"
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <assert.h>
 
 
 /**
@@ -12,15 +15,15 @@
 *     ThreadPool_t* - Pointer to the newly created ThreadPool object
 */
 ThreadPool_t* ThreadPool_create(unsigned int num) {
-    ThreadPool_t *pool = malloc(sizeof(ThreadPool_t));
+    ThreadPool_t *pool = (ThreadPool_t*) malloc(sizeof(ThreadPool_t));
 
-    *pool = (ThreadPool_t) {.num_threads = num, .active = 1};
+    *pool = (ThreadPool_t) {.num_threads = num, .active = 1, .idlecount = 0};
     pthread_mutex_init(&pool->lock, NULL);
     pthread_cond_init(&pool->signal, NULL);
     pool->jobs = (ThreadPool_job_queue_t) {.size = 0, .head = NULL};
-    pool->threads = malloc(sizeof(pthread_t) * num);
+    pool->threads = (pthread_t*)malloc(sizeof(pthread_t) * num);
 
-    for (int i = 0; i < num; i++) {
+    for (unsigned int i = 0; i < num; i++) {
         pthread_create(&pool->threads[i], NULL, Thread_run, pool);
     }
 
@@ -39,12 +42,12 @@ void ThreadPool_destroy(ThreadPool_t* tp) {
     pthread_cond_broadcast(&tp->signal);
 
     for (int i = 0; i < tp->num_threads; i++) {
-        pthread_join(&tp->threads[i], NULL);
+        pthread_join(tp->threads[i], NULL);
     }
 
     free(tp->threads);
 
-    //free jobs
+    //free jobs in queue
     ThreadPool_job_t *temp = NULL;
     ThreadPool_job_t *curr = tp->jobs.head;
     while (curr != NULL) {
@@ -78,7 +81,7 @@ bool ThreadPool_add_job(ThreadPool_t* tp, thread_func_t func, void* arg, int job
     }
 
     //create new job
-    ThreadPool_job_t* newjob = malloc(sizeof(ThreadPool_job_t));
+    ThreadPool_job_t* newjob = (ThreadPool_job_t*)malloc(sizeof(ThreadPool_job_t));
     newjob->func = func;
     newjob->arg = arg;
     newjob->next = NULL;
@@ -89,7 +92,12 @@ bool ThreadPool_add_job(ThreadPool_t* tp, thread_func_t func, void* arg, int job
     //add to queue
     if (tp->jobs.head == NULL){
         tp->jobs.head = newjob;
-    } else {
+    } 
+    else if (newjob->length <= tp->jobs.head->length) {
+        newjob->next = tp->jobs.head;
+        tp->jobs.head = newjob;
+    }
+    else {
         ThreadPool_job_t *prev = NULL;
         ThreadPool_job_t *curr = tp->jobs.head;
 
@@ -103,6 +111,15 @@ bool ThreadPool_add_job(ThreadPool_t* tp, thread_func_t func, void* arg, int job
     }
 
     tp->jobs.size++;
+    assert(tp->jobs.size > 0);
+
+    ThreadPool_job_t *curr = tp->jobs.head;
+    printf("Job queue: ");
+    while (curr != NULL) {
+        printf("%d ", curr->length);
+        curr = curr->next;
+    }
+    printf("\n");
     pthread_cond_signal(&tp->signal);
     pthread_mutex_unlock(&tp->lock);
     return true;
@@ -131,7 +148,9 @@ ThreadPool_job_t* ThreadPool_get_job(ThreadPool_t* tp) {
 * Parameters:
 *     tp - Pointer to the ThreadPool object containing this thread
 */
-void* Thread_run(ThreadPool_t* tp) {
+void* Thread_run(void* arg) {
+    ThreadPool_t *tp = (ThreadPool_t*) arg;
+
     while (tp->active == 1) {
 
         //retrieve job from job queue
@@ -139,19 +158,22 @@ void* Thread_run(ThreadPool_t* tp) {
 
         //If queue is empty, put thread to sleep until threadPool_add_job signals again
         if (tp->jobs.head == NULL) {
+            tp->idlecount++;
             pthread_cond_wait(&tp->signal, &tp->lock);
+            tp->idlecount--;
         }
-        
+
         ThreadPool_job_t *job = ThreadPool_get_job(tp);
         pthread_mutex_unlock(&tp->lock);
         
         //execute job
         if (job != NULL) {
+            printf("Executing job of length %d %s\n", job->length, (char*)job->arg);
             job->func(job->arg);
+            free(job);
         }
     }
-
-    return;
+    return NULL;
 }
 
 /**
@@ -159,5 +181,6 @@ void* Thread_run(ThreadPool_t* tp) {
 * Parameters:
 *     tp - Pointer to the ThreadPool object
 */
-void ThreadPool_check(ThreadPool_t *tp);
-    
+void ThreadPool_check(ThreadPool_t *tp) {
+    while(tp->jobs.size != 0 && tp->idlecount != tp->num_threads);
+}

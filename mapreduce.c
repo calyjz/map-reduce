@@ -1,18 +1,32 @@
+#define _GNU_SOURCE
+
 #include "mapreduce.h"
 #include "threadpool.h"
 #include <sys/stat.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <assert.h>
 
-typedef struct {
+
+typedef struct KeyValue_t {
     char* key;
     char* value;
     struct KeyValue_t *next;
 } KeyValue_t;
 
-typedef struct {
+typedef struct Partition_t {
     KeyValue_t* head;
     int size;
     pthread_mutex_t lock;
+    KeyValue_t *current;
 } Partition_t;
+
+typedef struct ThreadArg{
+    int value;
+    Reducer reducer; 
+} ThreadArg_t;
 
 Partition_t *partitions;
 unsigned int num_partitions;
@@ -31,38 +45,64 @@ void MR_Run(unsigned int file_count, char *file_names[], Mapper mapper, Reducer 
     ThreadPool_t* threadpool = ThreadPool_create(num_workers);
 
     //initialize partitions
-    partitions = malloc(sizeof(Partition_t) * num_parts);
+    partitions = (Partition_t*) malloc(sizeof(Partition_t) * num_parts);
     num_partitions = num_parts;
 
-    for (int i = 0; i < num_parts; i++) {
+    for (unsigned int i = 0; i < num_parts; i++) {
         partitions[i].head = NULL;
         partitions[i].size = 0;
         pthread_mutex_init(&partitions[i].lock, NULL);
     }
 
     // submit map jobs to queue
-    for (int i = 0; i < file_count; i++) {
+    for (unsigned int i = 0; i < file_count; i++) {
         // get file size
         struct stat sb;
         stat(file_names[i], &sb);
 
         // submit job
-        ThreadPool_add_job(threadpool, mapper, file_names[i], sb.st_size);
+        printf("Submiting job %s of size %ld to queue\n", file_names[i], sb.st_size);
+        ThreadPool_add_job(threadpool, (thread_func_t)mapper, file_names[i], sb.st_size);
     }
 
-    //wait for all mapping jobs to finish
+    //print partitions
+    sleep(3);
+    fprintf(stderr, "SLEEP: %d\n", __LINE__);
+    for (unsigned int i = 0; i < num_parts; i++) {
+        KeyValue_t *curr = partitions[i].head;
+        printf("Partition %d: {", i);
+        while (curr != NULL) {
+            printf("%s:%s, ", curr->key, curr->value);
+            curr = curr->next;
+        }
+        printf("}\n");
+    }
 
-    //add all reduce jobs to the queue
+    // wait for all mapping jobs to finish
 
-    //wait for all reduce jobs to finish
+    // add all reduce jobs to the queue
+    for (int i = 0; i < num_partitions; i++) {
+        ThreadArg_t *args = (ThreadArg_t*)malloc(sizeof(ThreadArg_t));
+        args->reducer = reducer;
+        args->value = i;
+        printf("Submiting reduce job of partition %d with size %d to queue\n", i, partitions[i].size);
+        ThreadPool_add_job(threadpool, MR_Reduce, args, partitions[i].size);
+    }
+    // wait for all reduce jobs to finish
+    sleep(3);
 
-    //cleanup and exit
-    for (int i = 0; i < num_parts; i++) {
+    // cleanup and exit
+    for (unsigned int i = 0; i < num_parts; i++)
+    {
         KeyValue_t *temp;
         KeyValue_t *curr = partitions[i].head;
 
-        while (curr != NULL) {
+        // free keyvalues
+        while (curr != NULL)
+        {
             temp = curr->next;
+            free(curr->key);
+            free(curr->value);
             free(curr);
             curr = temp;
         }
@@ -79,28 +119,37 @@ void MR_Run(unsigned int file_count, char *file_names[], Mapper mapper, Reducer 
 *     value         - Value of the output
 */
 void MR_Emit(char* key, char* value) {
+    pid_t tid = gettid();
     int index = MR_Partitioner(key, num_partitions);
-    Partition_t* partition = &partitions[index];
+
+    Partition_t *partition = &partitions[index];
     pthread_mutex_lock(&partition->lock);
+    printf("%d: LOCKED: mapping %s to partition %d\n", tid, key, index);
+
 
     //insert Key-Value pair into linked list in alphabetical order
-    KeyValue_t *new_pair = malloc(sizeof(KeyValue_t));
-    new_pair->key = key;
-    new_pair->value = value;
+    KeyValue_t *new_pair = (KeyValue_t*) malloc(sizeof(KeyValue_t));
+    new_pair->key = strdup(key);
+    new_pair->value = strdup(value);
     new_pair->next = NULL;
 
     if (partition->head == NULL) {
+        fprintf(stderr, "Queue is empty: %d\n", __LINE__);
         //empty list
         partition->head = new_pair;
-    } else if (strcmp(partition->head->key, new_pair->key) > 0 ) {
+
+    } else if (strcmp(partition->head->key, new_pair->key) >= 0 ) {
+        fprintf(stderr, "Insert at Head: %d\n", __LINE__);
         //insert at head
         new_pair->next = partition->head;
         partition->head = new_pair;
+
     } else {
+        fprintf(stderr, "insert at middle: %d\n", __LINE__);
         //insert in middle of list
         KeyValue_t* prev = NULL;
         KeyValue_t* curr = partition->head;
-
+        assert(curr != NULL);
         while (curr != NULL && strcmp(curr->key, new_pair->key) < 0) {
             prev = curr;
             curr = curr->next;
@@ -108,7 +157,17 @@ void MR_Emit(char* key, char* value) {
         prev->next = new_pair;
         new_pair->next = curr;
     }
+
     partition->size++;
+    // KeyValue_t *curr = partition->head;
+    assert(partition->size >= 1);
+    // for (int i = 0; i < partition->size; i++)
+    // {
+    //     printf("%s -> ", curr->key);
+    //     curr = curr->next;
+    // }
+    printf("\n%d UNLOCKED\n", tid);
+
     pthread_mutex_unlock(&partition->lock);
 }
 
@@ -136,7 +195,22 @@ unsigned int MR_Partitioner(char* key, unsigned int num_partitions) {
 * Parameters:
 *     threadarg     - Pointer to a hidden args object
 */
-void MR_Reduce(void* threadarg);
+void MR_Reduce(void* threadarg) {
+    printf("running MR_Reduce\n");
+    ThreadArg_t *args = (ThreadArg_t *)threadarg;
+    int index = args->value;
+    Reducer reducer = args->reducer;
+
+    Partition_t* partition = &partitions[index];
+    partition->current = partition->head;
+
+    while (partition->current != NULL) {
+        printf("Reducing key %s\n", partition->current->key);
+        reducer(partition->current->key, index);
+    }
+
+    free(args);
+}
 
 /**
 * Get the next value of the given key in the partition
@@ -147,5 +221,26 @@ void MR_Reduce(void* threadarg);
 *     char *        - Value of the next <key, value> pair if its key is the current key
 *     NULL          - Otherwise
 */
-char* MR_GetNext(char* key, unsigned int partition_idx);
+char* MR_GetNext(char* key, unsigned int partition_idx) {
+    Partition_t *partition = &partitions[partition_idx];
 
+    // printf("Partition from current: ");
+    // KeyValue_t *curr = partition->current;
+    // while (curr != NULL){
+    //     printf("%s -> ", curr->key);
+    //     curr = curr->next;
+    // }
+    // printf("\n");
+
+    if (partition->current == NULL) {
+        return NULL;
+    }
+
+    if (strcmp(partition->current->key, key) == 0) {
+        char *value = strdup(partition->current->value);
+        partition->current = partition->current->next;
+        return value;
+    }
+
+    return NULL;
+}
