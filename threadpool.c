@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
+#include <unistd.h>
 
 
 /**
@@ -20,7 +21,9 @@ ThreadPool_t* ThreadPool_create(unsigned int num) {
     *pool = (ThreadPool_t) {.num_threads = num, .active = 1, .idlecount = 0};
     pthread_mutex_init(&pool->lock, NULL);
     pthread_cond_init(&pool->signal, NULL);
-    pool->jobs = (ThreadPool_job_queue_t) {.size = 0, .head = NULL};
+    pool->jobs.size = 0;
+    pool->jobs.head = NULL;
+    pool->jobs.tail = NULL;
     pool->threads = (pthread_t*)malloc(sizeof(pthread_t) * num);
 
     for (unsigned int i = 0; i < num; i++) {
@@ -36,10 +39,13 @@ ThreadPool_t* ThreadPool_create(unsigned int num) {
 *     tp - Pointer to the ThreadPool object to be destroyed
 */
 void ThreadPool_destroy(ThreadPool_t* tp) {
-    tp->active = 0;
 
     //free threads
+    pthread_mutex_lock(&tp->lock);
+    tp->active = 0;
     pthread_cond_broadcast(&tp->signal);
+    pthread_mutex_unlock(&tp->lock);
+
 
     for (int i = 0; i < tp->num_threads; i++) {
         pthread_join(tp->threads[i], NULL);
@@ -92,34 +98,16 @@ bool ThreadPool_add_job(ThreadPool_t* tp, thread_func_t func, void* arg, int job
     //add to queue
     if (tp->jobs.head == NULL){
         tp->jobs.head = newjob;
-    } 
-    else if (newjob->length <= tp->jobs.head->length) {
-        newjob->next = tp->jobs.head;
-        tp->jobs.head = newjob;
+        tp->jobs.tail = newjob;
     }
     else {
-        ThreadPool_job_t *prev = NULL;
-        ThreadPool_job_t *curr = tp->jobs.head;
-
-        while (curr != NULL && curr->length < newjob->length) {
-            prev = curr;
-            curr = curr->next;
-        }
-
-        prev->next = newjob;
-        newjob->next = curr;
+        tp->jobs.tail->next = newjob;
+        tp->jobs.tail = newjob;
     }
-
+    
     tp->jobs.size++;
     assert(tp->jobs.size > 0);
 
-    ThreadPool_job_t *curr = tp->jobs.head;
-    printf("Job queue: ");
-    while (curr != NULL) {
-        printf("%d ", curr->length);
-        curr = curr->next;
-    }
-    printf("\n");
     pthread_cond_signal(&tp->signal);
     pthread_mutex_unlock(&tp->lock);
     return true;
@@ -138,6 +126,10 @@ ThreadPool_job_t* ThreadPool_get_job(ThreadPool_t* tp) {
     if (job) {
         tp->jobs.head = job->next;
         tp->jobs.size--;
+
+        if (tp->jobs.head == NULL) {
+            tp->jobs.tail = NULL;
+        }
     }
     return job;
 }
@@ -168,7 +160,6 @@ void* Thread_run(void* arg) {
         
         //execute job
         if (job != NULL) {
-            printf("Executing job of length %d %s\n", job->length, (char*)job->arg);
             job->func(job->arg);
             free(job);
         }
@@ -182,5 +173,13 @@ void* Thread_run(void* arg) {
 *     tp - Pointer to the ThreadPool object
 */
 void ThreadPool_check(ThreadPool_t *tp) {
-    while(tp->jobs.size != 0 && tp->idlecount != tp->num_threads);
+    while (1) {
+        pthread_mutex_lock(&tp->lock);
+        if (tp->jobs.size == 0 && tp->idlecount == tp->num_threads) {
+            pthread_mutex_unlock(&tp->lock);
+            break;
+        }
+        pthread_mutex_unlock(&tp->lock);
+        usleep(10000); //Sleep for 10 milliseconds to allow program to progress
+    }
 }

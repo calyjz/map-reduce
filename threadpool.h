@@ -16,6 +16,7 @@ typedef struct ThreadPool_job_t {
 typedef struct {
     unsigned int size;       // no. jobs in the queue
     ThreadPool_job_t* head;  // pointer to the first (shortest) job
+    ThreadPool_job_t *tail;
 } ThreadPool_job_queue_t;
 
 typedef struct {
